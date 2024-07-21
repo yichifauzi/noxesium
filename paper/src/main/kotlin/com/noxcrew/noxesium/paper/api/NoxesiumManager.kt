@@ -13,7 +13,9 @@ import com.noxcrew.noxesium.paper.api.rule.RuleFunction
 import com.noxcrew.noxesium.paper.v0.NoxesiumListenerV0
 import com.noxcrew.noxesium.paper.v1.NoxesiumListenerV1
 import com.noxcrew.noxesium.paper.v2.NoxesiumListenerV2
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket
 import org.bukkit.Bukkit
+import org.bukkit.craftbukkit.entity.CraftPlayer
 import org.bukkit.entity.Player
 import org.bukkit.event.EventHandler
 import org.bukkit.event.HandlerList
@@ -47,6 +49,8 @@ public open class NoxesiumManager(
     private val settings = ConcurrentHashMap<UUID, ClientSettings>()
     private val profiles = ConcurrentHashMap<UUID, NoxesiumProfile>()
     private val rules = ConcurrentHashMap<Int, RuleFunction<*>>()
+    private val ready = ConcurrentHashMap.newKeySet<UUID>()
+    private val pending = ConcurrentHashMap<UUID, Pair<Int, String>>()
 
     private lateinit var v0: BaseNoxesiumListener
     private lateinit var v1: BaseNoxesiumListener
@@ -70,7 +74,13 @@ public open class NoxesiumManager(
 
         // Register a player when we receive the client information packet
         NoxesiumPackets.SERVER_CLIENT_INFO.addListener(this) { packet, player ->
-            registerPlayer(player, packet.protocolVersion)
+            // If the player hasn't told the server about their plugin channels yet we wait!
+            if (player.uniqueId !in ready) {
+                pending[player.uniqueId] = packet.protocolVersion to packet.versionString
+                return@addListener
+            }
+
+            registerPlayer(player, packet.protocolVersion, packet.versionString)
         }
         NoxesiumPackets.SERVER_CLIENT_SETTINGS.addListener(this) { packet, player ->
             saveSettings(player, packet.settings)
@@ -92,19 +102,39 @@ public open class NoxesiumManager(
     }
 
     /**
+     * Marks that a player is ready to start receiving packets, that is they have confirmed with
+     * the server the existance of at least one Noxesium channel.
+     */
+    public fun markReady(player: Player) {
+        ready += player.uniqueId
+        val (protocolVersion, version) = pending.remove(player.uniqueId) ?: return
+        registerPlayer(player, protocolVersion, version)
+    }
+
+    /**
+     * Sends this packet to the given [player].
+     */
+    public fun createPacket(player: Player, packet: NoxesiumPacket): ClientboundCustomPayloadPacket? {
+        val protocol = getProtocolVersion(player) ?: return null
+
+        // Use the newest protocol this client supports!
+        return if (protocol < NoxesiumFeature.API_V1.minProtocolVersion) {
+            v0.createPacket(player, packet)
+        } else if (protocol < NoxesiumFeature.API_V2.minProtocolVersion) {
+            v1.createPacket(player, packet)
+        } else {
+            v2.createPacket(player, packet)
+        }
+    }
+
+    /**
      * Sends this packet to the given [player].
      */
     public fun sendPacket(player: Player, packet: NoxesiumPacket) {
-        val protocol = getProtocolVersion(player) ?: return
-
         // Use the newest protocol this client supports!
-        if (protocol < NoxesiumFeature.API_V1.minProtocolVersion) {
-            v0.sendPacket(player, packet)
-        } else if (protocol < NoxesiumFeature.API_V2.minProtocolVersion) {
-            v1.sendPacket(player, packet)
-        } else {
-            v2.sendPacket(player, packet)
-        }
+        val nmsPacket = createPacket(player, packet) ?: return
+        val craftPlayer = player as CraftPlayer
+        craftPlayer.handle.connection.send(nmsPacket)
     }
 
     /**
@@ -112,9 +142,9 @@ public open class NoxesiumManager(
      * the player back various packets related to the server information and default
      * server rule values.
      */
-    internal fun registerPlayer(player: Player, protocolVersion: Int) {
-        logger.info("${player.name} is running Noxesium protocol $protocolVersion")
-        saveProtocol(player, protocolVersion)
+    internal fun registerPlayer(player: Player, protocolVersion: Int, version: String) {
+        logger.info("${player.name} is running Noxesium $version ($protocolVersion)")
+        saveProtocol(player, version, protocolVersion)
 
         // Inform the player about which version is being used
         sendPacket(player, ClientboundServerInformationPacket(ProtocolVersion.VERSION))
@@ -161,15 +191,15 @@ public open class NoxesiumManager(
     }
 
     /** Registers a new server rule with the given [index] and [ruleSupplier]. */
-    internal fun registerServerRule(index: Int, ruleSupplier: RuleFunction<*>) {
+    public fun registerServerRule(index: Int, ruleSupplier: RuleFunction<*>) {
         require(!rules.containsKey(index)) { "Can't double register index $index" }
         rules[index] = ruleSupplier
     }
 
-    /** Stores the protocol version for [player] as [protocolVersion]. */
-    internal fun saveProtocol(player: Player, protocolVersion: Int) {
+    /** Stores the protocol version for [player] as [version] with [protocolVersion]. */
+    internal fun saveProtocol(player: Player, version: String, protocolVersion: Int) {
         players[player.uniqueId] = protocolVersion
-        onPlayerVersionReceived(player, protocolVersion)
+        onPlayerVersionReceived(player, version, protocolVersion)
     }
 
     /** Stores client settings for [player] as [clientSettings]. */
@@ -207,6 +237,8 @@ public open class NoxesiumManager(
         players -= e.player.uniqueId
         settings -= e.player.uniqueId
         profiles -= e.player.uniqueId
+        ready - e.player.uniqueId
+        pending -= e.player.uniqueId
     }
 
     /** Called when [player] is registered as a Noxesium user. */
@@ -214,7 +246,7 @@ public open class NoxesiumManager(
     }
 
     /** Called when [player] informs the server they are on [protocolVersion]. */
-    protected open fun onPlayerVersionReceived(player: Player, protocolVersion: Int) {
+    protected open fun onPlayerVersionReceived(player: Player, version: String, protocolVersion: Int) {
     }
 
     /** Called when [player] informs the server they are using [ClientSettings]. */

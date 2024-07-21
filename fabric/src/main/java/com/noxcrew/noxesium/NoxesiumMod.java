@@ -4,25 +4,35 @@ import com.google.common.base.Preconditions;
 import com.noxcrew.noxesium.api.protocol.ClientSettings;
 import com.noxcrew.noxesium.api.protocol.ProtocolVersion;
 import com.noxcrew.noxesium.config.NoxesiumConfig;
-import com.noxcrew.noxesium.feature.island.MccIslandTracker;
-import com.noxcrew.noxesium.feature.render.NoxesiumReloadListener;
+import com.noxcrew.noxesium.feature.TeamGlowHotkeys;
+import com.noxcrew.noxesium.feature.entity.ExtraEntityData;
+import com.noxcrew.noxesium.feature.entity.ExtraEntityDataModule;
+import com.noxcrew.noxesium.feature.entity.QibBehaviorModule;
+import com.noxcrew.noxesium.feature.model.CustomServerCreativeItems;
 import com.noxcrew.noxesium.feature.rule.ServerRuleModule;
+import com.noxcrew.noxesium.feature.rule.ServerRules;
 import com.noxcrew.noxesium.feature.skull.SkullFontModule;
 import com.noxcrew.noxesium.feature.sounds.NoxesiumSoundModule;
+import com.noxcrew.noxesium.feature.ui.NoxesiumReloadListener;
 import com.noxcrew.noxesium.network.NoxesiumPacketHandling;
 import com.noxcrew.noxesium.network.NoxesiumPackets;
 import com.noxcrew.noxesium.network.serverbound.ServerboundClientInformationPacket;
 import com.noxcrew.noxesium.network.serverbound.ServerboundClientSettingsPacket;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.networking.v1.C2SPlayChannelEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientConfigurationConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.resource.ResourceManagerHelper;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.packs.PackType;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -32,7 +42,8 @@ import java.util.Map;
 public class NoxesiumMod implements ClientModInitializer {
 
     public static final String BUKKIT_COMPOUND_ID = "PublicBukkitValues";
-    public static final String IMMOVABLE_TAG = new ResourceLocation(ProtocolVersion.NAMESPACE, "immovable").toString();
+    public static final String IMMOVABLE_TAG = ResourceLocation.fromNamespaceAndPath(ProtocolVersion.NAMESPACE, "immovable").toString();
+    public static final String RAW_MODEL_TAG = ResourceLocation.fromNamespaceAndPath(ProtocolVersion.NAMESPACE, "raw_model").toString();
 
     private static NoxesiumMod instance;
 
@@ -51,16 +62,21 @@ public class NoxesiumMod implements ClientModInitializer {
      */
     private boolean initialized = false;
 
-    /**
-     * The configuration file used by the mod.
-     */
     private final NoxesiumConfig config = NoxesiumConfig.load();
+    private final Logger logger = LoggerFactory.getLogger("Noxesium");
 
     /**
      * Returns the known Noxesium instance.
      */
     public static NoxesiumMod getInstance() {
         return instance;
+    }
+
+    /**
+     * Returns the logger instance to use.
+     */
+    public Logger getLogger() {
+        return logger;
     }
 
     /**
@@ -76,6 +92,12 @@ public class NoxesiumMod implements ClientModInitializer {
      */
     public void registerModule(NoxesiumModule module) {
         modules.put(module.getClass(), module);
+        module.onStartup();
+
+        // Run onGroupRegistered for registered groups
+        for (var group : NoxesiumPackets.getRegisteredGroups()) {
+            module.onGroupRegistered(group);
+        }
     }
 
     /**
@@ -84,6 +106,13 @@ public class NoxesiumMod implements ClientModInitializer {
     @NotNull
     public <T extends NoxesiumModule> T getModule(Class<T> clazz) {
         return (T) Preconditions.checkNotNull(modules.get(clazz), "Could not get module " + clazz.getSimpleName());
+    }
+
+    /**
+     * Returns all registered Noxesium modules.
+     */
+    public Collection<NoxesiumModule> getAllModules() {
+        return modules.values();
     }
 
     /**
@@ -102,13 +131,20 @@ public class NoxesiumMod implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        // Don't initialize twice! This allows other mods to call NoxesiumMod#onInitializeClient to ensure it's done initializing.
+        if (instance == this) return;
+
         // Store the instance and register all modules
         instance = this;
+
         registerModule(new ServerRuleModule());
         registerModule(new SkullFontModule());
         registerModule(new NoxesiumSoundModule());
-        registerModule(new MccIslandTracker());
+        registerModule(new TeamGlowHotkeys());
         registerModule(new NoxesiumPacketHandling());
+        registerModule(new CustomServerCreativeItems());
+        registerModule(new ExtraEntityDataModule());
+        registerModule(new QibBehaviorModule());
 
         // Every time the client joins a server we send over information on the version being used,
         // we initialize when both packets are known ad we are in the PLAY phase, whenever both have
@@ -122,22 +158,25 @@ public class NoxesiumMod implements ClientModInitializer {
 
         // Call disconnection hooks
         ClientPlayConnectionEvents.DISCONNECT.register((ignored1, ignored2) -> {
-            // Reset the current max protocol version
-            currentMaxProtocol = ProtocolVersion.VERSION;
-            initialized = false;
+            uninitialize();
+        });
 
-            // Handle quitting the server
-            modules.values().forEach(NoxesiumModule::onQuitServer);
+        // Re-initialize when moving in/out of the config phase, we assume any server
+        // running a proxy that doesn't use the configuration phase between servers
+        // has their stuff set up well enough to remember the client's information.
+        ClientConfigurationConnectionEvents.START.register((ignored1, ignored2) -> {
+            uninitialize();
         });
 
         // Register all universal messaging channels
         NoxesiumPackets.registerPackets("universal");
 
-        // Call initialisation on all modules
-        modules.values().forEach(NoxesiumModule::onStartup);
-
         // Register the resource listener
         ResourceManagerHelper.get(PackType.CLIENT_RESOURCES).registerReloadListener(new NoxesiumReloadListener());
+
+        // Trigger registration of all server and entity rules
+        Object ignored = ServerRules.DISABLE_SPIN_ATTACK_COLLISIONS;
+        ignored = ExtraEntityData.DISABLE_BUBBLES;
     }
 
     /**
@@ -156,7 +195,7 @@ public class NoxesiumMod implements ClientModInitializer {
             initialized = true;
 
             // Send a packet containing information about the client version of Noxesium
-            new ServerboundClientInformationPacket(ProtocolVersion.VERSION).send();
+            new ServerboundClientInformationPacket(ProtocolVersion.VERSION, FabricLoader.getInstance().getModContainer(ProtocolVersion.NAMESPACE).map(mod -> mod.getMetadata().getVersion().getFriendlyString()).orElse("unknown")).send();
 
             // Inform the player about the GUI scale of the client
             syncGuiScale();
@@ -164,6 +203,21 @@ public class NoxesiumMod implements ClientModInitializer {
             // Call connection hooks
             modules.values().forEach(NoxesiumModule::onJoinServer);
         }
+    }
+
+    /**
+     * Un-initializes the connection with the server.
+     */
+    private void uninitialize() {
+        // Reset the current max protocol version
+        currentMaxProtocol = ProtocolVersion.VERSION;
+        initialized = false;
+
+        // Handle quitting the server
+        modules.values().forEach(NoxesiumModule::onQuitServer);
+
+        // Unregister additional packets
+        NoxesiumPackets.unregisterPackets();
     }
 
     /**
@@ -178,15 +232,15 @@ public class NoxesiumMod implements ClientModInitializer {
         var options = Minecraft.getInstance().options;
 
         new ServerboundClientSettingsPacket(
-                new ClientSettings(
-                        options.guiScale().get(),
-                        window.getGuiScale(),
-                        window.getGuiScaledWidth(),
-                        window.getGuiScaledHeight(),
-                        Minecraft.getInstance().isEnforceUnicode(),
-                        options.touchscreen().get(),
-                        options.notificationDisplayTime().get()
-                )
+            new ClientSettings(
+                options.guiScale().get(),
+                window.getGuiScale(),
+                window.getGuiScaledWidth(),
+                window.getGuiScaledHeight(),
+                Minecraft.getInstance().isEnforceUnicode(),
+                options.touchscreen().get(),
+                options.notificationDisplayTime().get()
+            )
         ).send();
     }
 }
